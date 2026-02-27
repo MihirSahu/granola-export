@@ -178,3 +178,60 @@ if not safe_title:
 | Synced to S3 | 208 (207 + INDEX.md) |
 
 The 3 skipped documents had no content in either the ProseMirror or HTML panel sources — likely meetings where no notes were taken.
+
+## Dead Ends & Failed Approaches
+
+### 1. `/v2/get-document` (single document fetch)
+
+Assumed the bulk `/v2/get-documents` endpoint would have a singular counterpart for fetching individual documents with full content. It returned 404 — the endpoint simply doesn't exist.
+
+### 2. Local SQLite extraction
+
+Spent significant time trying to extract the OPFS-backed `granola.db`. Attempted multiple header offsets (512, 1024, 4096 bytes) to find the SQLite data after the OPFS SAH Pool header. No SQLite magic bytes were found anywhere in the 3.7MB file. The database is likely encrypted or uses a non-standard page format.
+
+### 3. IndexedDB / LevelDB
+
+Checked `~/Library/Application Support/Granola/IndexedDB/file__0.indexeddb.leveldb/` for Yjs document updates. The LevelDB contained only key-value metadata (`last_flush_timestamp`, etc.) — no document content.
+
+### 4. `notes_markdown` field in cache
+
+The local cache (`cache-v4.json`) has a `notes_markdown` field on each document, which seemed promising. Only 2 out of 212 documents had it populated — Granola apparently doesn't pre-render markdown for most notes.
+
+### 5. ProseMirror content from cache vs API
+
+The local cache's `notes` field contained ProseMirror JSON for all 212 documents, but they were the same empty paragraph stubs as the API. The cache mirrors the API, not the rendered content.
+
+## Content Overlap Analysis
+
+The two working content sources are complementary, not redundant:
+
+```
+ProseMirror only (list API):   ~94 docs  ← user-edited notes
+HTML panels only (panels API): ~113 docs ← AI-generated summaries
+Both sources:                  ~1 doc
+Neither source:                3 docs    ← truly empty
+```
+
+Documents with ProseMirror content tend to be older (pre-YDoc migration). Newer documents store their user-edited content in YDocs (inaccessible) but have AI-generated panel summaries available via the panels API.
+
+## Potential Future Improvements
+
+- **Token refresh**: The WorkOS access token will eventually expire. Could add automatic refresh using the `refresh_token` from `supabase.json`.
+- **Incremental sync**: Track `updated_at` timestamps to only re-export changed documents instead of doing a full export each run.
+- **YDoc decryption**: If the OPFS SQLite encryption key can be found (likely in the Electron app's main process or Keychain), the full YDoc content could be extracted, potentially recovering the 3 empty documents.
+- **Transcript export**: The API has a `/v1/get-document-transcript` endpoint. Could export raw meeting transcripts alongside the summaries.
+- **Multiple panels**: Some documents may have multiple panels (different summary templates). Currently all panels are concatenated — could be split into separate sections or files.
+
+## File Structure
+
+```
+granola-export/
+├── granola_export.py      # Main export script
+├── requirements.txt       # Dependencies (requests)
+├── TECHNICAL_NOTES.md     # This file
+├── .gitignore             # Excludes log, cache, venv
+└── granola-notes/         # Output directory (generated)
+    ├── INDEX.md           # All notes listed by date (newest first)
+    └── YYYY/MM/DD/        # Date-organized folders
+        └── YYYY-MM-DD_Title.md
+```

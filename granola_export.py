@@ -1,10 +1,12 @@
 import argparse
+import base64
 import logging
 import re
 from pathlib import Path
 from datetime import datetime
 from html.parser import HTMLParser
 import json
+import time
 import requests
 
 # Configure logging
@@ -30,25 +32,94 @@ def get_headers(token):
     headers["Authorization"] = f"Bearer {token}"
     return headers
 
-def load_credentials():
+def is_token_expired(token):
+    parts = token.split('.')
+    if len(parts) != 3:
+        return False
+
+    try:
+        payload = parts[1] + '=' * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        exp = claims.get('exp')
+        return bool(exp and exp <= int(time.time()))
+    except Exception:
+        return False
+
+def load_stored_account_token():
+    accounts_path = Path.home() / "Library/Application Support/Granola/stored-accounts.json"
+    if not accounts_path.exists():
+        logger.debug(f"Stored accounts file not found at: {accounts_path}")
+        return None
+
+    with open(accounts_path, 'r') as f:
+        data = json.load(f)
+
+    accounts_raw = data.get('accounts')
+    if not accounts_raw:
+        return None
+
+    accounts = json.loads(accounts_raw) if isinstance(accounts_raw, str) else accounts_raw
+    if not isinstance(accounts, list):
+        return None
+
+    active_user_id = None
+    legacy_path = Path.home() / "Library/Application Support/Granola/supabase.json"
+    if legacy_path.exists():
+        try:
+            with open(legacy_path, 'r') as f:
+                legacy_data = json.load(f)
+            user_info = legacy_data.get('user_info')
+            if isinstance(user_info, str):
+                user_info = json.loads(user_info)
+            if isinstance(user_info, dict):
+                active_user_id = user_info.get('id')
+        except Exception:
+            active_user_id = None
+
+    def account_sort_key(account):
+        is_active = account.get('userId') == active_user_id if active_user_id else False
+        return (is_active, account.get('savedAt') or 0)
+
+    for account in sorted(accounts, key=account_sort_key, reverse=True):
+        tokens_raw = account.get('tokens')
+        if not tokens_raw:
+            continue
+        tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+        if not isinstance(tokens, dict):
+            continue
+        access_token = tokens.get('access_token')
+        if access_token and not is_token_expired(access_token):
+            logger.debug("Successfully loaded credentials from stored accounts")
+            return access_token
+
+    return None
+
+def load_legacy_supabase_token():
     creds_path = Path.home() / "Library/Application Support/Granola/supabase.json"
     if not creds_path.exists():
         logger.error(f"Credentials file not found at: {creds_path}")
         return None
 
+    with open(creds_path, 'r') as f:
+        data = json.load(f)
+
+    workos_tokens = json.loads(data['workos_tokens'])
+    access_token = workos_tokens.get('access_token')
+
+    if not access_token:
+        logger.error("No access token found in credentials file")
+        return None
+
+    if is_token_expired(access_token):
+        logger.error("Access token in supabase.json is expired")
+        return None
+
+    logger.debug("Successfully loaded credentials from supabase.json")
+    return access_token
+
+def load_credentials():
     try:
-        with open(creds_path, 'r') as f:
-            data = json.load(f)
-
-        workos_tokens = json.loads(data['workos_tokens'])
-        access_token = workos_tokens.get('access_token')
-
-        if not access_token:
-            logger.error("No access token found in credentials file")
-            return None
-
-        logger.debug("Successfully loaded credentials")
-        return access_token
+        return load_stored_account_token() or load_legacy_supabase_token()
     except Exception as e:
         logger.error(f"Error reading credentials file: {str(e)}")
         return None

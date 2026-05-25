@@ -33,17 +33,66 @@ def get_headers(token):
     return headers
 
 def is_token_expired(token):
+    claims = decode_jwt_claims(token)
+    if not claims:
+        return False
+    exp = claims.get('exp')
+    return bool(exp and exp <= int(time.time()))
+
+def decode_jwt_claims(token):
     parts = token.split('.')
     if len(parts) != 3:
-        return False
+        return None
 
     try:
         payload = parts[1] + '=' * (-len(parts[1]) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload))
-        exp = claims.get('exp')
-        return bool(exp and exp <= int(time.time()))
+        return json.loads(base64.urlsafe_b64decode(payload))
     except Exception:
-        return False
+        return None
+
+def refresh_workos_tokens(tokens):
+    refresh_token = tokens.get('refresh_token')
+    access_token = tokens.get('access_token')
+    claims = decode_jwt_claims(access_token) if access_token else None
+    client_id = claims.get('client_id') if claims else None
+    if not refresh_token or not client_id:
+        return None
+
+    response = requests.post(
+        "https://api.workos.com/user_management/authenticate",
+        headers={"Content-Type": "application/json"},
+        json={
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+    )
+    response.raise_for_status()
+    refreshed = response.json()
+    new_access_token = refreshed.get('access_token')
+    if not new_access_token:
+        return None
+
+    updated_tokens = dict(tokens)
+    updated_tokens.update(refreshed)
+    return updated_tokens
+
+def refresh_token_if_needed(tokens):
+    access_token = tokens.get('access_token')
+    if not access_token:
+        return None, False
+    if not is_token_expired(access_token):
+        return access_token, False
+
+    try:
+        refreshed = refresh_workos_tokens(tokens)
+    except Exception as e:
+        logger.error(f"Failed to refresh expired access token: {str(e)}")
+        return None, False
+
+    if not refreshed:
+        return None, False
+    return refreshed, True
 
 def load_stored_account_token():
     accounts_path = Path.home() / "Library/Application Support/Granola/stored-accounts.json"
@@ -58,6 +107,7 @@ def load_stored_account_token():
     if not accounts_raw:
         return None
 
+    accounts_was_string = isinstance(accounts_raw, str)
     accounts = json.loads(accounts_raw) if isinstance(accounts_raw, str) else accounts_raw
     if not isinstance(accounts, list):
         return None
@@ -87,10 +137,17 @@ def load_stored_account_token():
         tokens = json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
         if not isinstance(tokens, dict):
             continue
-        access_token = tokens.get('access_token')
-        if access_token and not is_token_expired(access_token):
+        token_or_tokens, refreshed = refresh_token_if_needed(tokens)
+        if refreshed:
+            account['tokens'] = json.dumps(token_or_tokens) if isinstance(tokens_raw, str) else token_or_tokens
+            data['accounts'] = json.dumps(accounts) if accounts_was_string else accounts
+            with open(accounts_path, 'w') as f:
+                json.dump(data, f)
+            logger.debug("Successfully refreshed credentials from stored accounts")
+            return token_or_tokens.get('access_token')
+        if token_or_tokens:
             logger.debug("Successfully loaded credentials from stored accounts")
-            return access_token
+            return token_or_tokens
 
     return None
 
@@ -110,12 +167,20 @@ def load_legacy_supabase_token():
         logger.error("No access token found in credentials file")
         return None
 
-    if is_token_expired(access_token):
+    token_or_tokens, refreshed = refresh_token_if_needed(workos_tokens)
+    if refreshed:
+        data['workos_tokens'] = json.dumps(token_or_tokens)
+        with open(creds_path, 'w') as f:
+            json.dump(data, f)
+        logger.debug("Successfully refreshed credentials from supabase.json")
+        return token_or_tokens.get('access_token')
+
+    if not token_or_tokens:
         logger.error("Access token in supabase.json is expired")
         return None
 
     logger.debug("Successfully loaded credentials from supabase.json")
-    return access_token
+    return token_or_tokens
 
 def load_credentials():
     try:

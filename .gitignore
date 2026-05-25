@@ -1,2 +1,6 @@
 granola_sync.log
 __pycache__
+venv/
+output/
+granola-notes/
+.env

@@ -7,6 +7,7 @@ from datetime import datetime
 from html.parser import HTMLParser
 import json
 import time
+import subprocess
 import requests
 
 # Configure logging
@@ -26,6 +27,8 @@ API_HEADERS_BASE = {
     "User-Agent": "Granola/7.41.2",
     "X-Client-Version": "7.41.2"
 }
+
+_encrypted_storage_cache = None
 
 def get_headers(token):
     headers = dict(API_HEADERS_BASE)
@@ -94,14 +97,117 @@ def refresh_token_if_needed(tokens):
         return None, False
     return refreshed, True
 
+def load_encrypted_storage_files():
+    global _encrypted_storage_cache
+    if _encrypted_storage_cache is not None:
+        return _encrypted_storage_cache
+
+    granola_dir = Path.home() / "Library/Application Support/Granola"
+    dek_path = granola_dir / "storage.dek"
+    file_names = ["stored-accounts.json", "supabase.json"]
+    existing_file_names = [file_name for file_name in file_names if (granola_dir / f"{file_name}.enc").exists()]
+    if not existing_file_names or not dek_path.exists():
+        _encrypted_storage_cache = {}
+        return _encrypted_storage_cache
+
+    script = r'''
+const fs = require('fs');
+const crypto = require('crypto');
+const {execFileSync} = require('child_process');
+
+const base = process.argv[1];
+const fileNames = process.argv.slice(2);
+
+function keychainPassword() {
+  try {
+    return execFileSync('security', ['find-generic-password', '-s', 'Granola Safe Storage', '-w'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function unpadPkcs7(buffer) {
+  const padding = buffer[buffer.length - 1];
+  if (!padding || padding > 16) throw new Error('Invalid padding');
+  return buffer.subarray(0, buffer.length - padding);
+}
+
+function decryptDek(password) {
+  const blob = fs.readFileSync(`${base}/storage.dek`);
+  if (blob.subarray(0, 3).toString() !== 'v10') throw new Error('Unsupported DEK format');
+  const key = crypto.pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1');
+  const iv = Buffer.alloc(16, ' ');
+  const decipher = crypto.createDecipheriv('aes-128-cbc', key, iv);
+  decipher.setAutoPadding(false);
+  const decrypted = Buffer.concat([decipher.update(blob.subarray(3)), decipher.final()]);
+  const dek = Buffer.from(unpadPkcs7(decrypted).toString('utf8'), 'base64');
+  if (dek.length !== 32) throw new Error('Invalid DEK length');
+  return dek;
+}
+
+function decryptStorage(fileName, dek) {
+  const blob = fs.readFileSync(`${base}/${fileName}.enc`);
+  const iv = blob.subarray(0, 12);
+  const tag = blob.subarray(blob.length - 16);
+  const ciphertext = blob.subarray(12, blob.length - 16);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', dek, iv, {authTagLength: 16});
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+}
+
+const password = keychainPassword();
+if (!password) process.exit(1);
+
+try {
+  const dek = decryptDek(password);
+  const output = {};
+  for (const fileName of fileNames) {
+    output[fileName] = JSON.parse(decryptStorage(fileName, dek));
+  }
+  process.stdout.write(JSON.stringify(output));
+  process.exit(0);
+} catch {
+  process.exit(1);
+}
+'''
+
+    try:
+        result = subprocess.run(
+            ["node", "-e", script, str(granola_dir), *existing_file_names],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        _encrypted_storage_cache = json.loads(result.stdout)
+    except Exception as e:
+        logger.debug(f"Unable to load encrypted Granola storage: {type(e).__name__}")
+        _encrypted_storage_cache = {}
+    return _encrypted_storage_cache
+
+def load_encrypted_storage_file(file_name):
+    return load_encrypted_storage_files().get(file_name)
+
+def load_storage_file(file_name):
+    encrypted_data = load_encrypted_storage_file(file_name)
+    if encrypted_data is not None:
+        return encrypted_data, True
+
+    path = Path.home() / "Library/Application Support/Granola" / file_name
+    if not path.exists():
+        return None, False
+    with open(path, 'r') as f:
+        return json.load(f), False
+
 def load_stored_account_token():
     accounts_path = Path.home() / "Library/Application Support/Granola/stored-accounts.json"
-    if not accounts_path.exists():
+    data, encrypted = load_storage_file("stored-accounts.json")
+    if data is None:
         logger.debug(f"Stored accounts file not found at: {accounts_path}")
         return None
-
-    with open(accounts_path, 'r') as f:
-        data = json.load(f)
 
     accounts_raw = data.get('accounts')
     if not accounts_raw:
@@ -141,8 +247,9 @@ def load_stored_account_token():
         if refreshed:
             account['tokens'] = json.dumps(token_or_tokens) if isinstance(tokens_raw, str) else token_or_tokens
             data['accounts'] = json.dumps(accounts) if accounts_was_string else accounts
-            with open(accounts_path, 'w') as f:
-                json.dump(data, f)
+            if not encrypted:
+                with open(accounts_path, 'w') as f:
+                    json.dump(data, f)
             logger.debug("Successfully refreshed credentials from stored accounts")
             return token_or_tokens.get('access_token')
         if token_or_tokens:
@@ -153,12 +260,10 @@ def load_stored_account_token():
 
 def load_legacy_supabase_token():
     creds_path = Path.home() / "Library/Application Support/Granola/supabase.json"
-    if not creds_path.exists():
+    data, encrypted = load_storage_file("supabase.json")
+    if data is None:
         logger.error(f"Credentials file not found at: {creds_path}")
         return None
-
-    with open(creds_path, 'r') as f:
-        data = json.load(f)
 
     workos_tokens = json.loads(data['workos_tokens'])
     access_token = workos_tokens.get('access_token')
@@ -170,8 +275,9 @@ def load_legacy_supabase_token():
     token_or_tokens, refreshed = refresh_token_if_needed(workos_tokens)
     if refreshed:
         data['workos_tokens'] = json.dumps(token_or_tokens)
-        with open(creds_path, 'w') as f:
-            json.dump(data, f)
+        if not encrypted:
+            with open(creds_path, 'w') as f:
+                json.dump(data, f)
         logger.debug("Successfully refreshed credentials from supabase.json")
         return token_or_tokens.get('access_token')
 

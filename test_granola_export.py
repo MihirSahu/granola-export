@@ -31,6 +31,11 @@ class FakeResponse:
         return self.payload
 
 
+class FakeCompletedProcess:
+    def __init__(self, stdout):
+        self.stdout = stdout
+
+
 class CredentialRefreshTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -41,6 +46,7 @@ class CredentialRefreshTests(unittest.TestCase):
         self.refreshed_token = fake_jwt(int(time.time()) + 3600)
 
     def tearDown(self):
+        granola_export._encrypted_storage_cache = None
         self.tempdir.cleanup()
 
     def test_legacy_supabase_token_refreshes_expired_access_token(self):
@@ -100,6 +106,66 @@ class CredentialRefreshTests(unittest.TestCase):
         saved_tokens = json.loads(saved["accounts"][0]["tokens"])
         self.assertEqual(saved_tokens["access_token"], self.refreshed_token)
         self.assertEqual(saved_tokens["refresh_token"], "refresh_new")
+
+    def test_stored_account_token_prefers_encrypted_storage(self):
+        stale_token = fake_jwt(int(time.time()) + 60)
+        encrypted_token = fake_jwt(int(time.time()) + 3600)
+        accounts_path = self.granola_dir / "stored-accounts.json"
+        accounts_path.write_text(json.dumps({
+            "accounts": [{
+                "userId": "user_1",
+                "savedAt": 1,
+                "tokens": json.dumps({"access_token": stale_token}),
+            }]
+        }))
+
+        encrypted_data = {
+            "accounts": json.dumps([{
+                "userId": "user_1",
+                "savedAt": 2,
+                "tokens": json.dumps({"access_token": encrypted_token}),
+            }])
+        }
+
+        with patch.object(granola_export.Path, "home", return_value=self.home), \
+             patch.object(granola_export, "load_encrypted_storage_file", return_value=encrypted_data, create=True):
+            token = granola_export.load_stored_account_token()
+
+        self.assertEqual(token, encrypted_token)
+
+    def test_legacy_supabase_token_prefers_encrypted_storage(self):
+        stale_token = fake_jwt(int(time.time()) + 60)
+        encrypted_token = fake_jwt(int(time.time()) + 3600)
+        creds_path = self.granola_dir / "supabase.json"
+        creds_path.write_text(json.dumps({
+            "workos_tokens": json.dumps({"access_token": stale_token})
+        }))
+
+        encrypted_data = {
+            "workos_tokens": json.dumps({"access_token": encrypted_token})
+        }
+
+        with patch.object(granola_export.Path, "home", return_value=self.home), \
+             patch.object(granola_export, "load_encrypted_storage_file", return_value=encrypted_data, create=True):
+            token = granola_export.load_legacy_supabase_token()
+
+        self.assertEqual(token, encrypted_token)
+
+    def test_encrypted_storage_cache_uses_one_decrypt_process(self):
+        (self.granola_dir / "storage.dek").write_bytes(b"dek")
+        (self.granola_dir / "stored-accounts.json.enc").write_bytes(b"accounts")
+        (self.granola_dir / "supabase.json.enc").write_bytes(b"supabase")
+        payload = {
+            "stored-accounts.json": {"accounts": "[]"},
+            "supabase.json": {"workos_tokens": "{}"},
+        }
+
+        with patch.object(granola_export.Path, "home", return_value=self.home), \
+             patch.object(granola_export.subprocess, "run", return_value=FakeCompletedProcess(json.dumps(payload))) as run:
+            self.assertEqual(granola_export.load_encrypted_storage_file("stored-accounts.json"), payload["stored-accounts.json"])
+            self.assertEqual(granola_export.load_encrypted_storage_file("supabase.json"), payload["supabase.json"])
+
+        self.assertEqual(run.call_count, 1)
 
 
 if __name__ == "__main__":

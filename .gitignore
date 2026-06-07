@@ -4,3 +4,8 @@ venv/
 output/
 granola-notes/
 .env
+supabase.json
+supabase.json.enc
+stored-accounts.json
+stored-accounts.json.enc
+storage.dek
